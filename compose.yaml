@@ -1,0 +1,97 @@
+services:
+  postgres:
+    image: public.ecr.aws/docker/library/postgres:17.7-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-weweb}
+      POSTGRES_USER: ${POSTGRES_USER:-weweb}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./imports/database:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+  minio:
+    image: quay.io/minio/minio:RELEASE.2025-06-13T11-33-47Z
+    restart: unless-stopped
+    command: server /data
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+    volumes: [minio-data:/data]
+  minio-init:
+    image: quay.io/minio/mc:RELEASE.2025-07-21T05-28-08Z
+    restart: "no"
+    depends_on: {minio: {condition: service_started}}
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+      MINIO_APP_USER: ${MINIO_APP_USER:?set MINIO_APP_USER in .env}
+      MINIO_APP_PASSWORD: ${MINIO_APP_PASSWORD:?set MINIO_APP_PASSWORD in .env}
+      STORAGE_PRIVATE_BUCKET: ${STORAGE_PRIVATE_BUCKET:-weweb-private}
+      STORAGE_PUBLIC_BUCKET: ${STORAGE_PUBLIC_BUCKET:-weweb-public}
+    entrypoint: ["/bin/sh", "-ec"]
+    command:
+      - |
+        for i in $$(seq 1 30); do mc alias set local http://minio:9000 "$$MINIO_ROOT_USER" "$$MINIO_ROOT_PASSWORD" && break; sleep 1; done
+        mc mb --ignore-existing "local/$$STORAGE_PRIVATE_BUCKET"
+        mc mb --ignore-existing "local/$$STORAGE_PUBLIC_BUCKET"
+        mc admin user add local "$$MINIO_APP_USER" "$$MINIO_APP_PASSWORD" || true
+        cat >/tmp/policy.json <<'EOF'
+        {"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:GetObject","s3:PutObject","s3:DeleteObject","s3:ListBucket"],"Resource":["arn:aws:s3:::*","arn:aws:s3:::*/*"]}]}
+        EOF
+        mc admin policy create local weweb-app /tmp/policy.json || true
+        mc admin policy attach local weweb-app --user "$$MINIO_APP_USER"
+  backend:
+    build: {context: ., dockerfile: docker/backend/Dockerfile}
+    restart: unless-stopped
+    depends_on:
+      postgres: {condition: service_healthy}
+      minio-init: {condition: service_completed_successfully}
+    environment:
+      PORT: 3030
+      NODE_ENV: development
+      ENV: production
+      DATABASE_URL: "postgresql://${POSTGRES_USER:-weweb}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-weweb}"
+      APP_URL: ${APP_URL:-http://127.0.0.1:8080}
+      SERVER_URL: ${APP_URL:-http://127.0.0.1:8080}
+      AUTH_SECRET: ${AUTH_SECRET:?set AUTH_SECRET in .env}
+      AUTH_INTEGRATION: ${AUTH_INTEGRATION:-weweb-auth}
+      PROVIDER_EMAIL_ENABLED: ${PROVIDER_EMAIL_ENABLED:-TRUE}
+      PROVIDER_EMAIL_VERIFICATION_ENABLED: ${PROVIDER_EMAIL_VERIFICATION_ENABLED:-FALSE}
+      PROVIDER_EMAIL_DISABLE_SIGNUP: ${PROVIDER_EMAIL_DISABLE_SIGNUP:-FALSE}
+      STORAGE_INTEGRATION: ${STORAGE_INTEGRATION:-aws-s3}
+      STORAGE_PRIVATE_BUCKET: ${STORAGE_PRIVATE_BUCKET:-weweb-private}
+      STORAGE_PUBLIC_BUCKET: ${STORAGE_PUBLIC_BUCKET:-weweb-public}
+      STORAGE_PRIVATE_PREFIX: ${STORAGE_PRIVATE_PREFIX:-private/}
+      STORAGE_PUBLIC_PREFIX: ${STORAGE_PUBLIC_PREFIX:-public/}
+      AWS_S3_REGION: ${AWS_S3_REGION:-us-east-1}
+      AWS_S3_ACCESS_KEY_ID: ${MINIO_APP_USER}
+      AWS_S3_SECRET_ACCESS_KEY: ${MINIO_APP_PASSWORD}
+      AWS_S3_ENDPOINT: http://minio:9000
+      LOCAL_HTTP: ${LOCAL_HTTP:-true}
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"fetch('http://127.0.0.1:3030/api/auth/get-session').then(r=>process.exit(r.status<500?0:1)).catch(()=>process.exit(1))\""]
+      interval: 5s
+      timeout: 4s
+      retries: 30
+  frontend:
+    build:
+      context: .
+      dockerfile: docker/frontend/Dockerfile
+      args:
+        APP_URL: "${APP_URL:-http://127.0.0.1:8080}"
+    restart: unless-stopped
+    depends_on: {backend: {condition: service_healthy}}
+    ports: ["${BIND_ADDRESS:-127.0.0.1}:${HTTP_PORT:-8080}:8080"]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://127.0.0.1:8080/ || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+volumes:
+  postgres-data:
+  minio-data:

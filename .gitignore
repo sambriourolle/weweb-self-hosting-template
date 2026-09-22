@@ -1,0 +1,11 @@
+.env
+.local.env
+imports/frontend/**
+!imports/frontend/.gitkeep
+imports/backend/**
+!imports/backend/.gitkeep
+imports/database/**
+!imports/database/.gitkeep
+build/
+backups/
+test-results/
